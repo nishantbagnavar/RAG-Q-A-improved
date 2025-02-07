@@ -1,9 +1,8 @@
 import streamlit as st
-import time
 import os
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate,MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -20,143 +19,129 @@ from langchain.callbacks import StreamlitCallbackHandler
 # Load environment variables
 load_dotenv()
 
-# API Keys
-os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
-os.environ['HF_TOKEN'] = os.getenv('HF_TOKEN')
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_PROJECT"] = "2-Q&A_RAG_Chatbot"
+# Streamlit UI Setup
+st.set_page_config(page_title="Conversational RAG Chatbot", layout="wide")
+st.title("📚 Conversational RAG Chatbot")
+st.markdown("Upload PDFs and ask questions based on their content.")
 
-embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# Sidebar API Key Input
+api_key = st.sidebar.text_input("🔑 Enter your Groq API Key:", type="password")
 
+# Ensure API key is provided
+if not api_key:
+    st.warning("⚠️ Please enter your Groq API Key.")
+    st.stop()
 
-## setting up straemlit app
-st.set_page_config(page_title="Conversational Rag")
-st.title("Conversational RAG With PDF uploads and Chathistory")
-st.write("Uplaod PDFs and chat with their content")
+# Initialize LLM (Groq's Gemma-2)
+llm = ChatGroq(groq_api_key=api_key, model="gemma2-9b-it")
 
-## input the groq api key
-api_key=st.sidebar.text_input("Enter your groq api key:",type="password")
+# Session ID for chat history
+session_id = st.text_input("🆔 Session ID:", value="default_session")
 
-## check if groq api key is provided
-if api_key:
-    llm=ChatGroq(groq_api_key=api_key,model="gemma2-9b-it")
+# Session-based storage
+if "store" not in st.session_state:
+    st.session_state.store = {}
 
-    ## chat interface
-    session_id=st.text_input("Session ID",value="default_session")
+# File Upload Section
+uploaded_files = st.file_uploader("📂 Upload PDF files", type="pdf", accept_multiple_files=True)
 
-    ## satefully manages chat history
-    if "store" not in st.session_state:
-        st.session_state.store={}
+# Process Uploaded Files
+if uploaded_files:
+    documents = []
+    for uploaded_file in uploaded_files:
+        temp_pdf = f"./temp.pdf"
+        with open(temp_pdf, "wb") as file:
+            file.write(uploaded_file.getvalue())
 
-    uploaded_files=st.file_uploader("Choose a PDF file",type="pdf",accept_multiple_files=True)
+        # Load PDF
+        loader = PyPDFLoader(temp_pdf)
+        docs = loader.load()
+        documents.extend(docs)
 
-    ## process uploaded file
-    if uploaded_files:
-        documents=[]
+    # Split Text for Better Indexing
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
+    splits = text_splitter.split_documents(documents)
 
-        for uploaded_file in uploaded_files:
-            temppdf=f"./temp.pdf"
-            with open(temppdf,"wb") as file:
-                file.write(uploaded_file.getvalue())
-                file_name=uploaded_file.name
+    # Create Vector Database
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vectorstore = FAISS.from_documents(splits, embeddings)
 
-            ##loader
-            loader=PyPDFLoader(temppdf)
-            docs=loader.load()
-            documents.extend(docs)
+    # Retriever
+    retriever = vectorstore.as_retriever()
 
-        ## splitting
-        text_splitter=RecursiveCharacterTextSplitter(chunk_size=5000,chunk_overlap=500)
-        splits=text_splitter.split_documents(documents)
+    # Contextualization Prompt (History-Aware)
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", "Reformulate user queries into standalone questions based on chat history."),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
 
-        ## vectorstore and embeddings
-        vectorstore=FAISS.from_documents(splits,embeddings)
+    # History-Aware Retriever
+    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
 
-        ## retriever
-        retriever=vectorstore.as_retriever()
+    # Optimized Answering Prompt
+    system_prompt = """
+    You are a knowledge-based AI assistant. Follow these guidelines:
 
-        ## prompts for history aware retriever
-        contextualize_q_system_prompt=(
-            """
-            Given a chat history and latest user question which might reference 
-            context in the chat history,formulate a standalone queistion which
-            can be understood without chat history.Do not answer question, just
-            reformulate it if needed and otherwise return it as is
-            """
-            
-        )
+    1️⃣ **Use ONLY the provided context** – Do not generate answers outside of it.  
+    2️⃣ **Be concise  – Provide structured, easy-to-read responses.  
+    3️⃣ **If the context lacks an answer, state: 'I don't have enough information to answer that.'**  
+    4️⃣ **Maintain clarity & accuracy** – Ensure logical, fact-based replies.  
 
-        contextualize_q_prompt=ChatPromptTemplate.from_messages(
-            [
-                ("system",contextualize_q_system_prompt),
-                MessagesPlaceholder("chat_history"),
-                ("human","{input}")
+    Context:  
+    {context}
+    """
 
-            ]
-        )
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
 
-        history_aware_retriever=create_history_aware_retriever(llm,retriever,contextualize_q_prompt)
+    # Answering Chain (RAG)
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
+    # Session History Management
+    def get_session_history(session_id: str) -> BaseChatMessageHistory:
+        if session_id not in st.session_state.store:
+            st.session_state.store[session_id] = ChatMessageHistory()
+        return st.session_state.store[session_id]
 
-        ## Answer Question prompt
-        system_prompt=(
-            """
-            You are an assistant for question answering tasks,use the following peices 
-            of retrieved context to answer the question. If you dont know the answer,
-            that you dont know. use three sentences maximum and keep the answer concise
-          
-            """
-            "\n\n"
-            "{context}"
-            
-        )
+    # Chat-Enabled RAG
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
 
-        qa_prompt=ChatPromptTemplate.from_messages(
-            [
-                ("system",system_prompt),
-                MessagesPlaceholder("chat_history"),
-                ("human","{input}")
-            ]
-        )
+    # Chat Interface
+    user_input = st.text_input("💬 Ask a Question:")
 
+    if user_input:
+        session_history = get_session_history(session_id)
 
-        ## chains
-        question_anwer_chain=create_stuff_documents_chain(llm,qa_prompt)
-        rag_chain=create_retrieval_chain(history_aware_retriever,question_anwer_chain)
-
-        ## history
-        def get_session_history(session_id:str)->BaseChatMessageHistory:
-            if session_id not in st.session_state.store:
-                st.session_state.store[session_id]=ChatMessageHistory()
-            return st.session_state.store[session_id]
-        
-        conversational_rag_chain=RunnableWithMessageHistory(
-            rag_chain,
-            get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
-        )
-
-
-        user_input=st.text_input("Your Question: ")
-        if user_input:
-            session_history=get_session_history(session_id)
-
-            response=conversational_rag_chain.invoke(
-                {"input":user_input},
-                config={"session_id":session_id}
+        with st.spinner("⏳ Generating response..."):
+            response = conversational_rag_chain.invoke(
+                {"input": user_input},
+                config={"session_id": session_id},
             )
 
-            st.write(st.session_state.store)
-            st.write("Assistant: ",response["answer"])
-            st.write("chat_history: ",session_history.messages)
+        # Store message history
+        session_history.add_user_message(user_input)
+        session_history.add_ai_message(response["answer"])
 
+        # Display response
+        st.success(response["answer"])
+
+        # Debugging Info (Optional)
+        with st.expander("📜 Chat History"):
+            st.write(session_history.messages)
 else:
-    st.warning("Enter api key")
-
-
-
-
-            
-
+    st.info("📥 Upload a PDF to begin chatting!")
